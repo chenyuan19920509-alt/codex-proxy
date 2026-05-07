@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PIDFILE="/tmp/codex-proxy.pid"
+LOGFILE="/tmp/proxy.log"
+PORT=4446
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROXY_JS="$SCRIPT_DIR/../proxy.js"
+
+usage() { echo "Usage: $(basename "$0") {start|stop|restart|status|log|health}"; exit 1; }
+
+check_port() {
+  local pid
+  pid=$(ss -tlnp "sport = :$PORT" 2>/dev/null | awk 'NR>1 {print $NF}' | grep -oP 'pid=\K[0-9]+' | head -1)
+  if [ -n "$pid" ]; then
+    local mypid; mypid=$(cat "$PIDFILE" 2>/dev/null || echo "")
+    [ "$pid" = "$mypid" ] && return 0  # it's us
+    echo "port $PORT already in use by PID $pid" >&2
+    return 1
+  fi
+}
+
+start() {
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "proxy is already running (PID $(cat "$PIDFILE"))"; return
+  fi
+  if ! check_port; then exit 1; fi
+  nohup node "$PROXY_JS" >> "$LOGFILE" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PIDFILE"
+  sleep 0.5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "proxy died immediately, last 3 log lines:" >&2
+    tail -3 "$LOGFILE" >&2
+    rm -f "$PIDFILE"
+    exit 1
+  fi
+  echo "proxy started (PID $pid)"
+}
+
+stop() {
+  if [ ! -f "$PIDFILE" ]; then echo "proxy is not running"; return; fi
+  local pid; pid=$(cat "$PIDFILE")
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "proxy is not running (stale PID file removed)"
+    rm -f "$PIDFILE"; return
+  fi
+  kill "$pid"
+  echo "proxy stopping (PID $pid)..."
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do sleep 1; i=$((i+1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "forcing kill..."; kill -9 "$pid"
+  fi
+  rm -f "$PIDFILE"
+  echo "proxy stopped"
+}
+
+restart() { stop; start; }
+
+status() {
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "proxy is running (PID $(cat "$PIDFILE"))"
+  else
+    echo "proxy is stopped"
+    rm -f "$PIDFILE" 2>/dev/null || true
+  fi
+}
+
+health() {
+  local resp; resp=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT/health" 2>&1 || true)
+  if [ "$resp" = "200" ]; then
+    curl -s "http://127.0.0.1:$PORT/health"
+  else
+    echo "proxy health check failed (HTTP $resp)" >&2
+    exit 1
+  fi
+}
+
+log() {
+  echo "==> tailing $LOGFILE (Ctrl+C to quit)"
+  exec tail -f "$LOGFILE"
+}
+
+cmd="${1:-}"; [ -z "$cmd" ] && usage
+case "$cmd" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) restart ;;
+  status)  status ;;
+  health)  health ;;
+  log)     log ;;
+  *)       usage ;;
+esac
