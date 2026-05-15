@@ -248,7 +248,7 @@ function runProbe() {
 function proxy(cReq, cRes) {
   totalRequests++;
   console.error(`[${ts()}] ${cReq.method} ${cReq.url}`);
-  const MAX_BODY = 512 * 1024;
+  const MAX_BODY = parseInt(process.env.MAX_BODY_KB || "10240") * 1024;
   const chunks = [];
   let bodyTooLarge = false;
   let bodyLen = 0;
