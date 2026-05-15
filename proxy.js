@@ -123,6 +123,12 @@ function buildMessages(input, instructions) {
     msgs.push({ role: "system", content: trimmed });
   }
 
+  // Responses API allows input as a plain string
+  if (typeof input === "string") {
+    msgs.push({ role: "user", content: input });
+    return msgs;
+  }
+
   if (!Array.isArray(input)) return msgs;
 
   for (const item of input) {
@@ -138,7 +144,7 @@ function buildMessages(input, instructions) {
       }
       if (!content.trim()) continue;
       const role = item.role === "assistant" ? "assistant"
-        : item.role === "developer" ? "user"
+        : item.role === "developer" ? "system"
         : "user";
       msgs.push({ role, content });
     } else if (item.type === "function_call") {
@@ -195,7 +201,7 @@ function ts() {
 let activeUpstream = 0;
 let totalRequests = 0;
 let errors5xx = 0;
-const MAX_CONCURRENT = 2;
+const MAX_CONCURRENT = process.env.PROXY_CONCURRENT ? parseInt(process.env.PROXY_CONCURRENT) : 6;
 const pendingQueue = [];
 
 function acquireSlot(cb) {
@@ -245,11 +251,12 @@ function proxy(cReq, cRes) {
   const MAX_BODY = 512 * 1024;
   const chunks = [];
   let bodyTooLarge = false;
+  let bodyLen = 0;
 
   cReq.on("data", (c) => {
     chunks.push(c);
-    const total = chunks.reduce((s, b) => s + b.length, 0);
-    if (total > MAX_BODY && !bodyTooLarge) {
+    bodyLen += c.length;
+    if (bodyLen > MAX_BODY && !bodyTooLarge) {
       bodyTooLarge = true;
       cRes.writeHead(413, { "Content-Type": "application/json" });
       cRes.end(JSON.stringify({ error: { type: "invalid_request_error", message: "Request body too large. Max 512KB." } }));
@@ -292,9 +299,8 @@ function proxy(cReq, cRes) {
       return;
     }
 
-    // Allow client to override model via X-Model header
-    const clientModel = (cReq.headers["x-model"] || "").trim();
-    const effectiveModel = clientModel || MODEL;
+    // Always use configured model — ignore client model
+    const effectiveModel = MODEL;
 
     if (path === "/v1/responses" && body) {
       try {
@@ -308,7 +314,9 @@ function proxy(cReq, cRes) {
         if (userMsgs.length === 0 && (!tools || !tools.length)) {
           const rid = "resp_" + Math.random().toString(36).slice(2, 10);
           const mid = "msg_" + Math.random().toString(36).slice(2, 6);
+        let headersSent = false;
           cRes.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+        headersSent = true;
           function emit(t, d) { cRes.write(`event: ${t}\ndata: ${JSON.stringify(d)}\n\n`); }
           emit("response.created", { type: "response.created", response: { id: rid, object: "response", model: effectiveModel, status: "in_progress", created_at: Math.floor(Date.now() / 1000), output: [] } });
           emit("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: mid, type: "message", role: "assistant", status: "in_progress", content: [] } });
@@ -328,8 +336,8 @@ function proxy(cReq, cRes) {
           model: effectiveModel,
           messages: msgs,
           stream: true,
-          temperature: r.temperature ?? 0.2,
-          top_p: r.top_p ?? 0.95,
+          temperature: r.temperature || 0.2,
+          top_p: r.top_p || 0.95,
           max_tokens: r.max_output_tokens || 32000,
           tools: tools,
           tool_choice: tools ? "auto" : undefined,
@@ -344,12 +352,13 @@ function proxy(cReq, cRes) {
       hostname: upstreamUrl.hostname,
       port: upstreamUrl.port || (upstreamUrl.protocol === "https:" ? 443 : 80),
       path, method: cReq.method, timeout: 120000,
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(upstreamBody), Authorization: `Bearer ${API_KEY}`, Accept: "application/json, text/event-stream" },
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(upstreamBody), Authorization: `Bearer ${API_KEY}`, "HTTP-Referer": "http://localhost", "X-Title": "codex-proxy", Accept: "application/json, text/event-stream" },
       agent: createProxyAgent(),
     };
 
     let attempt = 0;
     let fallbackIdx = 0;
+    let clientHeadersSent = false;
     const allModels = [effectiveModel, ...FALLBACKS];
     const MAX_RETRIES = 2;
     const BACKOFF = [300, 900, 2000];
@@ -365,7 +374,7 @@ function proxy(cReq, cRes) {
           b.model = curModel;
           upstreamBody = JSON.stringify(b);
           opts.headers["Content-Length"] = Buffer.byteLength(upstreamBody);
-        } catch (e) {}
+        } catch (e) { console.error(`[${ts()}] fallback model parse error: ${e.message}`); }
       }
       const upReq = client.request(opts, (uRes) => {
         if ((uRes.statusCode >= 500 || uRes.statusCode === 429) && attempt <= MAX_RETRIES) {
@@ -427,12 +436,20 @@ function proxy(cReq, cRes) {
 
         // ── SSE Streaming ──
         cRes.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+        clientHeadersSent = true;
         const rid = "resp_" + Math.random().toString(36).slice(2, 10);
-        let buf = "", started = false, text = "", reasoning = "", thinkingEmitted = false, usage = null;
+        let buf = "", started = false, messageStarted = false, text = "", reasoning = "", thinkingEmitted = false, usage = null;
         const tcMap = {};
         const tcList = [];
 
         function emit(t, d) { cRes.write(`event: ${t}\ndata: ${JSON.stringify(d)}\n\n`); }
+
+        function ensureMessageStarted() {
+          if (messageStarted) return;
+          messageStarted = true;
+          emit("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1", status: "in_progress", role: "assistant", content: [] } });
+          emit("response.content_part.added", { type: "response.content_part.added", item_id: "msg_1", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+        }
 
         uRes.on("data", (d) => {
           buf += d.toString();
@@ -450,15 +467,16 @@ function proxy(cReq, cRes) {
                 started = true;
                 emit("response.created", { type: "response.created", response: { id: rid, object: "response", model: effectiveModel, status: "in_progress", created_at: Math.floor(Date.now() / 1000), output: [] } });
                 emit("response.in_progress", { type: "response.in_progress", response_id: rid });
-                emit("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1", status: "in_progress", role: "assistant", content: [] } });
-                emit("response.content_part.added", { type: "response.content_part.added", item_id: "msg_1", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
               }
+
+              // ensureMessageStarted moved outside data handler for end handler access
 
               // Collect reasoning from thinking models (different APIs use different field names)
               const think = delta.reasoning_content || delta.reasoning || "";
               if (think) reasoning += think;
 
               if (delta.content) {
+                ensureMessageStarted();
                 // Prepend reasoning as a code-fenced block on first real content
                 if (reasoning && !thinkingEmitted) {
                   thinkingEmitted = true;
@@ -473,16 +491,19 @@ function proxy(cReq, cRes) {
 
               if (delta.tool_calls) for (const tc of delta.tool_calls) {
                 const idx = tc.index || 0;
-                if (!tcMap[idx]) { const t = { id: tc.id || ("call_" + idx), name: "", args: "" }; tcMap[idx] = t; tcList.push(t); }
+                if (!tcMap[idx]) { const t = { id: tc.id || ("call_" + idx), name: "", args: "", outputIndex: 1 + tcList.length, added: false }; tcMap[idx] = t; tcList.push(t); }
                 const cur = tcMap[idx];
                 if (tc.id) cur.id = tc.id;
                 if (tc.function?.name) {
                   cur.name = tc.function.name;
-                  emit("response.output_item.added", { type: "response.output_item.added", output_index: 1 + idx, item: { type: "function_call", id: cur.id, call_id: cur.id, name: cur.name, arguments: "", status: "in_progress" } });
+                  if (!cur.added) {
+                    cur.added = true;
+                    emit("response.output_item.added", { type: "response.output_item.added", output_index: cur.outputIndex, item: { type: "function_call", id: cur.id, call_id: cur.id, name: cur.name, arguments: "", status: "in_progress" } });
+                  }
                 }
                 if (tc.function?.arguments) {
                   cur.args += tc.function.arguments;
-                  emit("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: cur.id, output_index: 1 + idx, delta: tc.function.arguments });
+                  emit("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: cur.id, output_index: cur.outputIndex, delta: tc.function.arguments });
                 }
               }
 
@@ -494,6 +515,7 @@ function proxy(cReq, cRes) {
         uRes.on("end", () => {
           // If thinking model had reasoning but no text content, emit it now
           if (reasoning && !thinkingEmitted) {
+            ensureMessageStarted();
             text = "<thinking>\n" + reasoning + "\n</thinking>";
             emit("response.output_text.delta", { type: "response.output_text.delta", item_id: "msg_1", output_index: 0, content_index: 0, delta: text });
           }
@@ -501,11 +523,12 @@ function proxy(cReq, cRes) {
             emit("response.output_text.done", { type: "response.output_text.done", item_id: "msg_1", output_index: 0, content_index: 0, text });
             emit("response.content_part.done", { type: "response.content_part.done", item_id: "msg_1", output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } });
           }
-          emit("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { type: "message", id: "msg_1", status: "completed", role: "assistant", content: text ? [{ type: "output_text", text, annotations: [] }] : [] } });
+          if (messageStarted) emit("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { type: "message", id: "msg_1", status: "completed", role: "assistant", content: text ? [{ type: "output_text", text, annotations: [] }] : [] } });
           const outItems = text ? [{ type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] }] : [];
           for (let i = 0; i < tcList.length; i++) {
             const tc = tcList[i];
-            const oi = 1 + i;
+            const oi = tc.outputIndex;
+            if (!tc.added) emit("response.output_item.added", { type: "response.output_item.added", output_index: oi, item: { type: "function_call", id: tc.id, call_id: tc.id, name: tc.name, arguments: "", status: "in_progress" } });
             emit("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: tc.id, output_index: oi, arguments: tc.args });
             emit("response.output_item.done", { type: "response.output_item.done", output_index: oi, item: { type: "function_call", id: tc.id, call_id: tc.id, name: tc.name, arguments: tc.args, status: "completed" } });
             outItems.push({ type: "function_call", id: tc.id, call_id: tc.id, name: tc.name, arguments: tc.args, status: "completed" });
@@ -515,12 +538,14 @@ function proxy(cReq, cRes) {
           releaseSlot();
         });
         uRes.on("error", (e) => {
-          if (attempt <= MAX_RETRIES) { const delay = BACKOFF[attempt - 1] || 300; console.error(`[${ts()}] upstream res error retry ${attempt} in ${delay}ms:`, e.message); releaseSlot(); setTimeout(doUpstream, delay); }
+          if (clientHeadersSent) { console.error(`[${ts()}] upstream res error after headers sent, not retrying:`, e.message); cRes.end(); releaseSlot(); }
+          else if (attempt <= MAX_RETRIES) { const delay = BACKOFF[attempt - 1] || 300; console.error(`[${ts()}] upstream res error retry ${attempt} in ${delay}ms:`, e.message); releaseSlot(); setTimeout(doUpstream, delay); }
           else { cRes.end(); releaseSlot(); }
         });
       });
 
       upReq.on("error", (e) => {
+        if (clientHeadersSent) { console.error(`[${ts()}] upstream error after headers sent, not retrying:`, e.message); cRes.end(); releaseSlot(); return; }
         if (attempt <= MAX_RETRIES) { const delay = BACKOFF[attempt - 1] || 300; console.error(`[${ts()}] upstream req error retry ${attempt} in ${delay}ms:`, e.message); releaseSlot(); setTimeout(doUpstream, delay); }
         else { cRes.writeHead(502); cRes.end(JSON.stringify({ error: e.message })); releaseSlot(); }
       });
@@ -533,7 +558,15 @@ function proxy(cReq, cRes) {
   });
 }
 
-http.createServer(proxy).listen(PORT, "127.0.0.1", () => {
+// ── Global error handlers — prevent crash on unhandled errors ──
+process.on("uncaughtException", (err) => {
+  console.error(`[${ts()}] UNCAUGHT:`, err.message, err.stack?.split("\n")[1] || "");
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`[${ts()}] UNHANDLED_REJECTION:`, reason?.message || reason);
+});
+
+http.createServer(proxy).listen(PORT, "0.0.0.0", () => {
   console.log(`[${ts()}] proxy :${PORT} → ${UPSTREAM}`);
-  setTimeout(runProbe, 500);
+  runProbe();
 });
